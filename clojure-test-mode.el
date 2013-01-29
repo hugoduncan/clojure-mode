@@ -104,12 +104,15 @@
 (require 'cl)
 (require 'clojure-mode)
 (require 'which-func)
-(require 'nrepl)
+; (require 'nrepl) don't load if it isn't already present
 
 (declare-function nrepl-repl-buffer            "nrepl.el")
 (declare-function nrepl-make-response-handler  "nrepl.el")
 (declare-function nrepl-send-string            "nrepl.el")
 (declare-function nrepl-current-ns             "nrepl.el")
+
+(declare-function slime-eval-async             "slime.el")
+(declare-function slime-connected-p            "slime.el")
 
 ;; Faces
 
@@ -153,10 +156,68 @@
 
 ;; Support Functions
 
+(defun clojure-test-repl-connected-p ()
+  (or (clojure-test-nrepl-connected-p)
+      (clojure-test-slime-connected-p)))
+
+(defun clojure-test-eval (string &optional handler)
+  (cond
+   ((clojure-test-nrepl-connected-p) (clojure-test-nrepl-eval string handler))
+   ((clojure-test-slime-connected-p) (clojure-test-slime-eval string handler))))
+
+(defun clojure-test-load-reporting ()
+  (cond
+   ((clojure-test-nrepl-connected-p) (clojure-test-nrepl-load-reporting))
+   ((clojure-test-slime-connected-p) (clojure-test-slime-load-reporting))))
+
+(defun clojure-test-load-current-buffer ()
+  (cond
+   ((clojure-test-nrepl-connected-p) (clojure-test-nrepl-load-current-buffer))
+   ((clojure-test-slime-connected-p) (clojure-test-slime-load-current-buffer))))
+
+(defun clojure-test-get-results ()
+  (cond
+   ((clojure-test-nrepl-connected-p) #'clojure-test-nrepl-get-results)
+   ((clojure-test-slime-connected-p) #'clojure-test-slime-get-results)))
+
+;; SLIME support
+
+(defun clojure-test-slime-connected-p ()
+  (and (fboundp #'slime-connected-p) (slime-connected-p)))
+
+(slime-connected-p)
+
+(defun clojure-test-slime-eval (string &optional handler)
+  (slime-eval-async `(swank:eval-and-grab-output ,string)
+    (or handler #'identity)))
+
+(defun clojure-test-slime-load-current-buffer ()
+)
+
+(defun clojure-test-slime-load-reporting ()
+  "Redefine the test-is report function to store results in metadata."
+  (when (eq (compare-strings "clojure" 0 7 (slime-connection-name) 0 7) t)
+    (slime-eval `(swank:eval-and-grab-output ,clojure-test-reporting-form))))
+
+(defun clojure-test-slime-extract-results (results)
+  (let ((result-vars (read (cadr results))))
+    ;; slime-eval-async hands us a cons with a useless car
+    (mapc #'clojure-test-extract-result result-vars)
+    (slime-repl-emit (concat "\n" (make-string (1- (window-width)) ?=) "\n"))
+    (clojure-test-echo-results)))
+
+(defun clojure-test-slime-get-results (result)
+  (clojure-test-eval
+   (concat "(map #(cons (str (:name (meta %)))
+                (:status (meta %))) (vals (ns-interns '"
+           (slime-current-package) ")))")
+   #'clojure-test-slime-extract-results))
+
+;; nREPL support
 (defun clojure-test-nrepl-connected-p ()
   (get-buffer "*nrepl-connection*"))
 
-(defun clojure-test-make-handler (callback)
+(defun clojure-test-make-nrepl-handler (callback)
   (lexical-let ((buffer (current-buffer))
                 (callback callback))
     (nrepl-make-response-handler buffer
@@ -168,16 +229,13 @@
                                    (nrepl-emit-interactive-output err))
                                  '())))
 
-(defun clojure-test-eval (string &optional handler)
+(defun clojure-test-nrepl-eval (string &optional handler)
   (nrepl-send-string string
-                     (clojure-test-make-handler (or handler #'identity))
+                     (clojure-test-make-nepl-handler (or handler #'identity))
                      (or (nrepl-current-ns) "user")))
 
-(defun clojure-test-load-reporting ()
-  "Redefine the test-is report function to store results in metadata."
-  (when (clojure-test-nrepl-connected-p)
-    (nrepl-send-string-sync
-     "(ns clojure.test.mode
+(defvar clojure-test-reporting-form
+  "(ns clojure.test.mode
         (:use [clojure.test :only [file-position *testing-vars* *test-out*
                                    join-fixtures *report-counters* do-report
                                    test-var *initial-report-counters*]]))
@@ -219,17 +277,23 @@
             ;; Otherwise, just test every var in the namespace.
             (clojure-test-mode-test-one-var ns test-name))
           (do-report {:type :end-test-ns, :ns ns-obj}))
-        (do-report (assoc @*report-counters* :type :summary))))")))
+        (do-report (assoc @*report-counters* :type :summary))))")
 
-(defun clojure-test-get-results (buffer result)
+(defun clojure-test-nrepl-load-reporting ()
+  "Redefine the test-is report function to store results in metadata."
+  (when (clojure-test-nrepl-connected-p)
+    (nrepl-send-string-sync
+     clojure-test-reporting-form)))
+
+(defun clojure-test-nrepl-get-results (buffer result)
   (with-current-buffer buffer
     (clojure-test-eval
      (concat "(map #(cons (str (:name (meta %)))
                 (:status (meta %))) (vals (ns-interns '"
              (clojure-find-ns) ")))")
-     #'clojure-test-extract-results)))
+     #'clojure-test-nreplextract-results)))
 
-(defun clojure-test-extract-results (buffer results)
+(defun clojure-test-nrepl-extract-results (buffer results)
   (with-current-buffer buffer
     (let ((result-vars (read results)))
       (mapc #'clojure-test-extract-result result-vars)
@@ -319,8 +383,8 @@ Retuns the problem overlay if such a position is found, otherwise nil."
   (interactive)
   (save-some-buffers nil (lambda () (equal major-mode 'clojure-mode)))
   (message "Testing...")
-  (if (not (clojure-in-tests-p))
-      (nrepl-load-file (buffer-file-name)))
+  ;; (if (not (clojure-in-tests-p))
+  ;;     (nrepl-load-file (buffer-file-name)))
   (save-window-excursion
     (if (not (clojure-in-tests-p))
         (clojure-jump-to-test))
@@ -328,7 +392,7 @@ Retuns the problem overlay if such a position is found, otherwise nil."
     (clojure-test-eval (format "(binding [clojure.test/report clojure.test.mode/report]
                                        (clojure.test/run-tests '%s))"
                                (clojure-find-ns))
-                       #'clojure-test-get-results)))
+                       (clojure-test-get-results))))
 
 (defun clojure-test-run-test ()
   "Run the test at point."
@@ -421,10 +485,10 @@ Retuns the problem overlay if such a position is found, otherwise nil."
 
 \\{clojure-test-mode-map}"
   nil " Test" clojure-test-mode-map
-  (when (clojure-test-nrepl-connected-p)
-    (clojure-test-load-reporting)))
+  (clojure-test-load-reporting))
 
 (add-hook 'nrepl-connected-hook 'clojure-test-load-reporting)
+(add-hook 'slime-connected-hook 'clojure-test-load-reporting)
 
 ;;;###autoload
 (progn
