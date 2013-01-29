@@ -423,7 +423,27 @@ Retuns the problem overlay if such a position is found, otherwise nil."
         (message (replace-regexp-in-string "%" "%%"
                                            (overlay-get overlay 'message))))))
 
-(defun clojure-test-load-current-buffer ()
+(defun clojure-test-ediff-result ()
+  "Show the result of the test under point as an ediff"
+  (interactive)
+  (let ((overlay (find-if (lambda (o) (overlay-get o 'message))
+                          (overlays-at (point)))))
+    (if overlay
+        (let* ((m (overlay-get overlay 'message))
+               (f (string-match "Expected \\(.*\\), got \\(.*\\)" m)))
+          (message m)
+          (if f
+              (let ((exp-buffer (generate-new-buffer " *expected*"))
+                    (act-buffer (generate-new-buffer " *actual*")))
+                (with-current-buffer exp-buffer
+                  (insert (match-string-no-properties 1 m)))
+                (with-current-buffer act-buffer
+                  (insert (match-string-no-properties 2 m)))
+                (ediff-buffers
+                 (buffer-name exp-buffer) (buffer-name act-buffer)))
+            (message "Error, regex failed to match"))))))
+
+(defun clojure-test-nrepl-load-current-buffer ()
   (let ((command (format "(clojure.core/load-file \"%s\")\n(in-ns '%s)"
                          (buffer-file-name)
                          (clojure-find-ns))))
@@ -470,8 +490,8 @@ Retuns the problem overlay if such a position is found, otherwise nil."
     (define-key map (kbd "C-c C-,") 'clojure-test-run-tests)
     (define-key map (kbd "C-c ,")   'clojure-test-run-tests)
     (define-key map (kbd "C-c M-,") 'clojure-test-run-test)
-    (define-key map (kbd "C-c C-'") 'clojure-test-show-result)
     (define-key map (kbd "C-c '")   'clojure-test-show-result)
+    (define-key map (kbd "C-c C-'") 'clojure-test-ediff-result)
     (define-key map (kbd "C-c k")   'clojure-test-clear)
     (define-key map (kbd "C-c C-t") 'clojure-jump-between-tests-and-code)
     (define-key map (kbd "M-p")     'clojure-test-previous-problem)
