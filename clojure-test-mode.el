@@ -234,11 +234,12 @@
                      (clojure-test-make-nepl-handler (or handler #'identity))
                      (or (nrepl-current-ns) "user")))
 
-(defvar clojure-test-reporting-form
+(defconst clojure-test-reporting-form
   "(ns clojure.test.mode
         (:use [clojure.test :only [file-position *testing-vars* *test-out*
                                    join-fixtures *report-counters* do-report
-                                   test-var *initial-report-counters*]]))
+                                   test-var *initial-report-counters*]]
+              [clojure.pprint :only [pprint]]))
 
     (def #^{:dynamic true} *clojure-test-mode-out* nil)
     (defn report [event]
@@ -248,6 +249,8 @@
                                      [(:type event) (:message event)
                                       (str (:expected event))
                                       (str (:actual event))
+                                      (with-out-str (pprint (:expected event)))
+                                      (with-out-str (pprint (:actual event)))
                                       (if (and (= (:major *clojure-version*) 1)
                                                (< (:minor *clojure-version*) 2))
                                           ((file-position 2) 1)
@@ -304,14 +307,17 @@
   (dolist (is-result (rest result))
     (unless (member (aref is-result 0) clojure-test-ignore-results)
       (incf clojure-test-count)
-      (destructuring-bind (event msg expected actual line) (coerce is-result 'list)
+      (destructuring-bind
+          (event msg expected actual pp-expected pp-actual line)
+          (coerce is-result 'list)
         (if (equal :fail event)
             (progn (incf clojure-test-failure-count)
                    (clojure-test-highlight-problem
-                    line event (format "Expected %s, got %s" expected actual)))
+                    line event (format "Expected %s, got %s" expected actual)
+                    pp-expected pp-actual))
           (when (equal :error event)
             (incf clojure-test-error-count)
-            (clojure-test-highlight-problem line event actual))))))
+            (clojure-test-highlight-problem line event actual "" actual))))))
   (clojure-test-echo-results))
 
 (defun clojure-test-echo-results ()
@@ -325,7 +331,7 @@
           ((not (= clojure-test-failure-count 0)) 'clojure-test-failure-face)
           (t 'clojure-test-success-face)))))
 
-(defun clojure-test-highlight-problem (line event message)
+(defun clojure-test-highlight-problem (line event message pp-expected pp-actual)
   (save-excursion
     (goto-char (point-min))
     (forward-line (1- line))
@@ -335,7 +341,9 @@
         (overlay-put overlay 'face (if (equal event :fail)
                                        'clojure-test-failure-face
                                      'clojure-test-error-face))
-        (overlay-put overlay 'message message)))))
+        (overlay-put overlay 'message message)
+        (overlay-put overlay 'expected pp-expected)
+        (overlay-put overlay 'actual pp-actual)))))
 
 ;; Problem navigation
 (defun clojure-test-find-next-problem (here)
@@ -423,6 +431,21 @@ Retuns the problem overlay if such a position is found, otherwise nil."
         (message (replace-regexp-in-string "%" "%%"
                                            (overlay-get overlay 'message))))))
 
+
+(defvar clojure-test-ediff-buffers nil)
+(defun clojure-test-ediff-cleanup ()
+  "A function for ediff-cleanup-hook, to cleanup the temporary ediff buffers"
+  (mapc #'kill-buffer clojure-test-ediff-buffers))
+
+(defconst re1
+  "Expected \\(?:.\\|\n\\)*, got (not ([^ ]+ \\(\"\\(?:.\\|\n\\)+\"\\) \\(\"\\(?:.\\|\n\\)+\"\\)))"
+  "Match predicate on strings test")
+(defconst re2
+  "Expected \\(?:.\\|\n\\)*, got (not ([^ ]+ \\(\\(?:.\\|\n\\)+\\) \\(\\(?:.\\|\n\\)+\\)))"
+  "Match predicate test")
+(defconst re3 "Expected \\(\\(?:.\\|\n\\)+\\), got \\(\\(?:.\\|\n\\)+\\)"
+  "Match general test")
+
 (defun clojure-test-ediff-result ()
   "Show the result of the test under point as an ediff"
   (interactive)
@@ -430,8 +453,9 @@ Retuns the problem overlay if such a position is found, otherwise nil."
                           (overlays-at (point)))))
     (if overlay
         (let* ((m (overlay-get overlay 'message))
-               (f (string-match "Expected \\(.*\\), got \\(.*\\)" m)))
-          (message m)
+               (f (or (string-match re1 m)
+                      (string-match re2 m)
+                      (string-match re3 m))))
           (if f
               (let ((exp-buffer (generate-new-buffer " *expected*"))
                     (act-buffer (generate-new-buffer " *actual*")))
@@ -439,9 +463,27 @@ Retuns the problem overlay if such a position is found, otherwise nil."
                   (insert (match-string-no-properties 1 m)))
                 (with-current-buffer act-buffer
                   (insert (match-string-no-properties 2 m)))
+                (setq clojure-test-ediff-buffers
+                      (list (buffer-name exp-buffer) (buffer-name act-buffer)))
                 (ediff-buffers
                  (buffer-name exp-buffer) (buffer-name act-buffer)))
             (message "Error, regex failed to match"))))))
+
+(defun clojure-test-pprint-result ()
+  "Show the result of the test in a pretty printed form"
+  (interactive)
+  (let ((overlay (find-if (lambda (o) (overlay-get o 'message))
+                          (overlays-at (point)))))
+    (if overlay
+        (let* ((expected (overlay-get overlay 'expected))
+               (actual (overlay-get overlay 'actual)))
+          (let ((pp-buffer (generate-new-buffer " *clojure-test-output*")))
+            (with-current-buffer pp-buffer
+              (insert "Expected\n")
+              (insert expected)
+              (insert "\n\nActual\n")
+              (insert actual)
+              (switch-to-buffer (current-buffer))))))))
 
 (defun clojure-test-nrepl-load-current-buffer ()
   (let ((command (format "(clojure.core/load-file \"%s\")\n(in-ns '%s)"
@@ -492,6 +534,7 @@ Retuns the problem overlay if such a position is found, otherwise nil."
     (define-key map (kbd "C-c M-,") 'clojure-test-run-test)
     (define-key map (kbd "C-c '")   'clojure-test-show-result)
     (define-key map (kbd "C-c C-'") 'clojure-test-ediff-result)
+    (define-key map (kbd "C-c M-'") 'clojure-test-pprint-result)
     (define-key map (kbd "C-c k")   'clojure-test-clear)
     (define-key map (kbd "C-c C-t") 'clojure-jump-between-tests-and-code)
     (define-key map (kbd "M-p")     'clojure-test-previous-problem)
